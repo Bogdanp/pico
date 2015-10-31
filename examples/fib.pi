@@ -1,0 +1,18 @@
+(define fib
+  (lambda (n)
+    (if (< n 2)
+      n
+      (+ (fib (- n 2))
+         (fib (- n 1))))))
+
+(define print-first-11
+  (lambda ()
+    (define acc
+      (lambda (i)
+        (if (<= i 10)
+          (do
+            (display (fib i) #\n)
+            (acc (+ i 1))))))
+    (acc 0)))
+
+(print-first-11)

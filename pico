@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+# flake8: noqa
+"""Usage: {} <filename>
+Where <filename> is the path to a Pico source file."""
+import os
+import sys
+
+from functools import reduce
+
+DIGITS = '0123456789.'
+WHITESPACE = ' \r\t\n'
+PARENTHESES = '()'
+
+def error(message, lexer=None):
+    print('{}:{}:{}: {}.'.format(
+        lexer.filename, lexer.line, lexer.column, message
+    ) if lexer else message)
+    sys.exit(1)
+
+def builtins():
+    import lib.scheme
+    import math
+    builtins = vars(math)
+    for name in dir(lib.scheme):
+        if name[0] != '_':
+            fn = lib.scheme._get(name)
+            for id_ in fn.__doc__.split():
+                builtins.update({id_: fn})
+    return builtins
+
+class Environment(dict):
+    def __init__(self, p=(), a=(), parent=None):
+        self.update(zip(p, a))
+        self.parent = parent
+
+    def find(self, name):
+        try:
+            return self if name in self else self.parent.find(name)
+        except AttributeError:
+            error("name '{}' is undefined".format(name))
+
+    def get(self, name):
+        return self.find(name)[name]
+
+ENV = Environment()
+ENV.update(builtins())
+ENV.update({
+    'open': open,
+    'else': True,
+    'length': len,
+    'round': round,
+    'abs': abs,
+    'all': all,
+    'map': map,
+    'max': max,
+    'min': min,
+    'reduce': reduce,
+    'sum': sum,
+    '#t': True,
+    '#f': False,
+    '#\\n': '\n',
+    '#\s': ' ',
+    'nil': []
+})
+
+class Token:
+    def __init__(self, type_, value, filename, line, column):
+        self.type_, self.value = type_, value
+        self.line, self.column = line, column
+        self.filename = filename
+
+    def __repr__(self):
+        return "<Token {}: '{}' ({}, {})>".format(
+            self.type_, self.value,
+            self.line, self.column
+        )
+
+class Lexer:
+    def __init__(self, filename):
+        self.filename = filename
+        self.stream, self.index = open(filename).read(), 0
+        self.line, self.column = 1, 0
+        self.previous_column = 0
+
+    def create_token(self, type_, value):
+        return Token(type_, value, self.filename, self.line, self.column)
+
+    def advance(self):
+        try:
+            character = self.stream[self.index]
+            self.index += 1
+        except IndexError:
+            raise EOFError
+        return character
+
+    def retract(self):
+        try:
+            self.index -= 1
+            return self.stream[self.index]
+        except IndexError:
+            self.index = 0
+            return self.stream[self.index]
+
+    def peek(self):
+        character = self.advance()
+        self.retract()
+        return character
+
+    def read(self):
+        self.update_position()
+        return self.advance()
+
+    def update_position(self, reverse=False):
+        step = -1 if reverse else 1
+        try: character = self.stream[self.index]
+        except IndexError: return
+        if character == '\n':
+            self.previous_column = self.column if not reverse else self.previous_column
+            self.column = self.previous_column if reverse else 0
+            self.line += step
+        else:
+            self.column += step
+
+    def eat_comment(self):
+        try:
+            while self.read() != '\n': pass
+        except EOFError:
+            return
+
+    def eat_whitespace(self):
+        try:
+            while self.peek() in WHITESPACE:
+                self.read()
+        except EOFError:
+            return
+
+    def read_identifier(self, identifier=''):
+        self.retract()
+        self.update_position(True)
+        while self.peek() not in WHITESPACE + PARENTHESES:
+            identifier += self.read()
+        return identifier
+
+    def read_number(self, number=''):
+        self.retract()
+        self.update_position(True)
+        while self.peek() in DIGITS:
+            number += self.read()
+        if self.peek() not in WHITESPACE + PARENTHESES:
+            error("'{}' is not a valid number".format(number + self.peek()), self)
+        return number
+
+    def read_quote(self, data=''):
+        while self.peek() not in WHITESPACE + PARENTHESES:
+            data += self.read()
+        return data
+
+    def read_string(self, string=''):
+        while self.peek() != '"':
+            string += self.read()
+        # Skip closing quote
+        self.read()
+        return string
+
+    def tokenize(self):
+        while True:
+            try: character = self.read()
+            except EOFError: break
+            if character == ';':
+                self.eat_comment()
+            elif character in WHITESPACE:
+                self.eat_whitespace()
+            elif character == "'":
+                yield self.create_token('QUOTE', self.read_quote())
+            elif character == '"':
+                yield self.create_token('STRING', self.read_string())
+            elif character in PARENTHESES:
+                yield self.create_token('PARENTHESIS', character)
+            elif character in DIGITS[:-1]:
+                yield self.create_token('NUMBER', self.read_number())
+            else:
+                yield self.create_token('ID', self.read_identifier())
+
+def primitive_load(env, token):
+    try:
+        open(token.value, 'r')
+    except IOError:
+        error("cannot open file '{}' for inclusion".format(token.value), token)
+    interpret(token.value)
+
+def primitive_cond(env, *branches):
+    for branch in branches:
+        (condition, E) = branch
+        if evaluate(condition, env):
+            return evaluate(E, env)
+
+def primitive_define(env, token, E):
+    if isinstance(token, list):
+        env[token[0].value] = primitive_lambda(env, token[1:], E)
+    else:
+        env[token.value] = evaluate(E, env)
+
+def primitive_display(env, *E):
+    print(''.join(str(evaluate(e, env)) for e in E), end='')
+
+def primitive_if(env, condition, if_branch, *else_branch):
+    if evaluate(condition, env):
+        return evaluate(if_branch, env)
+    if else_branch:
+        return evaluate(else_branch[0], env)
+
+def primitive_let(env, pairs, *E):
+    values = [evaluate(e, env) for e in pairs[1::2]]
+    names = [token.value for token in pairs[::2]]
+    env = Environment(names, values, env)
+    for expression in E:
+        evaluate(expression, env)
+
+def primitive_set(env, name, E):
+    name = name.value
+    env.find(name)[name] = evaluate(E, env)
+
+def primitive_lambda(env, params, *E):
+    params = [t.value for t in params]
+    body, return_ = E[:-1], E[-1]
+    for e in body:
+        evaluate(e, env)
+    return lambda *args: evaluate(return_, Environment(params, args, env))
+
+def primitive_do(env, *E):
+    body, return_ = E[:-1], E[-1]
+    for e in body:
+        evaluate(e, env)
+    return evaluate(return_, env)
+
+def to_expression(tokens):
+    try: token = tokens.pop(0)
+    except IndexError: return
+    if token.type_ == 'PARENTHESIS':
+        if token.value == '(':
+            E = []
+            try:
+                while tokens[0].value != ')':
+                    E.append(to_expression(tokens))
+            except IndexError:
+                error('unexpected EOF', token)
+            tokens.pop(0)
+            return E
+        elif token.value == ')':
+            error("unexpected ')'", token)
+    return token
+
+def evaluate_symbol(token, env):
+    if token.type_ == 'ID':
+        return env.get(token.value)
+    elif token.type_ == 'NUMBER':
+        try: return int(token.value)
+        except ValueError:
+            try: return float(token.value)
+            except ValueError:
+                error('invalid number', token)
+    return token.value
+
+def evaluate_expression(E, env):
+    try:
+        return {
+            'do': primitive_do,
+            'if': primitive_if,
+            'let': primitive_let,
+            'set!': primitive_set,
+            'cond': primitive_cond,
+            'load': primitive_load,
+            'define': primitive_define,
+            'lambda': primitive_lambda,
+            'display': primitive_display,
+        }[E[0].value](env, *E[1:])
+    except KeyError:
+        E = [evaluate(e, env) for e in E]
+        p = E.pop(0)
+        return p(*E)
+
+def evaluate(E, env=ENV):
+    try:
+        return evaluate_symbol(E, env)
+    except AttributeError:
+        return evaluate_expression(E, env)
+
+def interpret(filename):
+    ts = list(Lexer(filename).tokenize())
+    while True:
+        E = to_expression(ts)
+        if not E: break
+        try: evaluate(E)
+        except Exception as e: error(e)
+
+def main(args):
+    try:
+        # Set the working directory to that of the source file.
+        os.chdir(os.path.abspath(os.path.dirname(args[1])))
+        interpret(os.path.basename(args[1]))
+    except IndexError:
+        error(__doc__.format(args[0]))
+    except IOError as e:
+        error('pico: {}.'.format(e))
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

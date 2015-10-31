@@ -1,0 +1,3 @@
+(display "Hello, World!" #\n)
+(display (+ 1 2 3) #\n)
+(display (cons 1 nil) #\n)
