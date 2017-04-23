@@ -1,3 +1,3 @@
 # pico
 
-A tiny Lisp I wrote many moons ago.
+A tiny Lisp I wrote circa 2008.
